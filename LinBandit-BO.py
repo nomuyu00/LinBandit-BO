@@ -10,6 +10,7 @@ LinBandit-BO: Linear Bandit-based Bayesian Optimization
 - Linear UCBで探索方向を適応的に選択
 - ベイズ最適化で選択された方向に沿って最適点を探索
 - 高次元でも効率的に動作（100次元以上でも実用的）
+- 最適化された設定：0.5x arms + 勾配ベース報酬
 """
 
 import math
@@ -45,7 +46,7 @@ class LinBanditBO:
     """
     
     def __init__(self, objective_function, bounds, n_initial=5, n_max=100, 
-                 coordinate_ratio=0.8):
+                 coordinate_ratio=0.8, n_arms=None):
         """
         Parameters
         ----------
@@ -59,6 +60,8 @@ class LinBanditBO:
             最大評価回数
         coordinate_ratio : float
             座標方向の割合（0.0-1.0）。1.0なら全て座標方向、0.0なら全てランダム方向。
+        n_arms : int or None
+            アーム数。Noneの場合は次元数の半分（最適化された設定）を使用。
         """
         self.objective_function = objective_function
         self.bounds = bounds.float()
@@ -66,6 +69,9 @@ class LinBanditBO:
         self.n_initial = n_initial
         self.n_max = n_max
         self.coordinate_ratio = coordinate_ratio
+        
+        # 最適なアーム数設定（実験結果に基づく）
+        self.n_arms = n_arms if n_arms is not None else max(1, self.dim // 2)
         
         # Linear Banditのパラメータ
         self.A = torch.eye(self.dim)
@@ -84,6 +90,9 @@ class LinBanditBO:
         self.theta_history = []
         self.scale_init = 1.0
         self.total_iterations = 0
+        
+        # 推定リプシッツ定数
+        self.L_hat = 1.0
         
     def update_model(self):
         """ガウス過程モデルの更新"""
@@ -118,8 +127,9 @@ class LinBanditBO:
         """
         LinBandit-BOの特徴的な部分：ランダムに方向を選択
         座標方向とランダム方向を組み合わせた候補集合を生成
+        実験結果に基づき、最適なアーム数（0.5x arms）を使用
         """
-        num_coord = int(self.coordinate_ratio * self.dim)
+        num_coord = int(self.coordinate_ratio * self.n_arms)
         num_coord = min(num_coord, self.dim)
         
         # ランダムに座標を選択（LinBandit-BOの特徴）
@@ -135,7 +145,7 @@ class LinBanditBO:
         coord_arms = torch.stack(coords, 0) if coords else torch.zeros(0, self.dim, device=self.X.device)
         
         # ランダム方向の生成
-        num_rand = self.dim - num_coord
+        num_rand = self.n_arms - num_coord
         rand_arms = torch.randn(num_rand, self.dim, device=self.X.device) if num_rand > 0 else torch.zeros(0, self.dim, device=self.X.device)
         
         if num_rand > 0:
@@ -232,7 +242,8 @@ class LinBanditBO:
     
     def optimize(self):
         """メインの最適化ループ"""
-        print(f"LinBandit-BO開始: {self.dim}次元, 最大{self.n_max}回評価")
+        print(f"LinBandit-BO開始: {self.dim}次元, アーム数: {self.n_arms}本, 最大{self.n_max}回評価")
+        print(f"最適化設定: 勾配ベース報酬 + 0.5x arms (実験結果に基づく)")
         
         # 初期化
         self.initialize()
@@ -256,14 +267,33 @@ class LinBanditBO:
                 predicted_mean = self.model.posterior(new_x.unsqueeze(0)).mean.squeeze().item()
             actual_y = self.objective_function(new_x.unsqueeze(0)).squeeze().item()
             
-            # 報酬の計算（予測誤差に基づく）
-            prediction_error = abs(predicted_mean - actual_y)
-            reward = 10.0 * (1.0 - math.exp(-prediction_error / self.scale_init))
+            # 報酬の計算（勾配ベース - 実験結果に基づく最適設計）
+            new_x_for_grad = new_x.clone().unsqueeze(0)
+            new_x_for_grad.requires_grad_(True)
+            
+            # GPモデルで事後分布を取得
+            posterior = self.model.posterior(new_x_for_grad)
+            mean_at_new_x = posterior.mean
+            
+            # 勾配を計算
+            mean_at_new_x.sum().backward()
+            grad_vector = new_x_for_grad.grad.squeeze(0)
+            
+            # 報酬ベクトルを定義（絶対値を取ることで影響の大きさを評価）
+            reward_vector = grad_vector.abs()
+            
+            # 推定リプシッツ定数の更新
+            grad_norm = reward_vector.norm().item()
+            if grad_norm > self.L_hat:
+                self.L_hat = grad_norm
+            
+            # リプシッツ定数でスケーリング
+            scaled_reward_vector = reward_vector / self.L_hat
             
             # Linear Banditパラメータの更新
             x_arm = direction.view(-1, 1)
             self.A += x_arm @ x_arm.t()
-            self.b += reward * direction
+            self.b += scaled_reward_vector  # 勾配ベース報酬（リプシッツスケーリング）
             
             # データとモデルの更新
             self.X = torch.cat([self.X, new_x.unsqueeze(0)], 0)
@@ -282,11 +312,12 @@ class LinBanditBO:
             
             # 進捗表示
             if n_iter % 10 == 0:
-                print(f"  評価回数: {n_iter}/{self.n_max}, 現在の最良値: {self.best_value:.6f}")
+                print(f"  評価回数: {n_iter}/{self.n_max}, 現在の最良値: {self.best_value:.6f}, L_hat: {self.L_hat:.4f}")
                 
         print(f"\n最適化完了!")
         print(f"最良値: {self.best_value:.6f}")
         print(f"最良点: {self.best_point[:5]}... (最初の5次元)")
+        print(f"最終L_hat: {self.L_hat:.6f}")
         
         return self.best_point, self.best_value
 
@@ -306,9 +337,9 @@ def rastrigin(x):
 
 
 def run_demo():
-    """LinBandit-BOのデモ実行"""
+    """LinBandit-BOのデモ実行（最適化された設定）"""
     print("=" * 60)
-    print("LinBandit-BO デモ")
+    print("LinBandit-BO デモ（最適化設定版）")
     print("=" * 60)
     
     # 問題設定
