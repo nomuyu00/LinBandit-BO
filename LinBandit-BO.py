@@ -46,7 +46,7 @@ class LinBanditBO:
     """
     
     def __init__(self, objective_function, bounds, n_initial=5, n_max=100, 
-                 coordinate_ratio=0.8, n_arms=None):
+                 coordinate_ratio=0.8, n_arms=None, L_min: float = 0.1):
         """
         Parameters
         ----------
@@ -62,6 +62,8 @@ class LinBanditBO:
             座標方向の割合（0.0-1.0）。1.0なら全て座標方向、0.0なら全てランダム方向。
         n_arms : int or None
             アーム数。Noneの場合は次元数の半分（最適化された設定）を使用。
+        L_min : float
+            勾配ノルムの推定値 L_hat に対する下限値。報酬スケーリングの安定化のために使用。
         """
         self.objective_function = objective_function
         self.bounds = bounds.float()
@@ -91,8 +93,9 @@ class LinBanditBO:
         self.scale_init = 1.0
         self.total_iterations = 0
         
-        # 推定リプシッツ定数
-        self.L_hat = 1.0
+        # 推定リプシッツ定数と下限
+        self.L_min = float(L_min)
+        self.L_hat = max(1.0, self.L_min)
         
     def update_model(self):
         """ガウス過程モデルの更新"""
@@ -282,13 +285,15 @@ class LinBanditBO:
             # 報酬ベクトルを定義（絶対値を取ることで影響の大きさを評価）
             reward_vector = grad_vector.abs()
             
-            # 推定リプシッツ定数の更新
+            # 推定リプシッツ定数の更新（下限付き）
             grad_norm = reward_vector.norm().item()
             if grad_norm > self.L_hat:
                 self.L_hat = grad_norm
-            
-            # リプシッツ定数でスケーリング
-            scaled_reward_vector = reward_vector / self.L_hat
+            # 下限を適用
+            L_effective = max(self.L_hat, self.L_min)
+
+            # リプシッツ定数でスケーリング（下限によりスパイク抑制）
+            scaled_reward_vector = reward_vector / L_effective
             
             # Linear Banditパラメータの更新
             x_arm = direction.view(-1, 1)
