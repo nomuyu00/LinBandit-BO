@@ -1,5 +1,7 @@
 # 勾配ベース vs コサイン類似度ベース 報酬設計の比較実験
 
+2025/9/3
+
 ## 目的
 高次元最適化におけるLinBandit-BOの報酬設計を比較する。Rastrigin/Styblinski‑Tang上で、(A) 勾配ベース（L下限付きスケーリング）と (B) コサイン類似度ベースの性能・安定性を評価する。
 
@@ -65,3 +67,18 @@
 - 収束挙動の含意: 報酬の絶対値比較はアルゴリズム優劣の判断材料にならず、重要なのは探索方向の質とEI最適化との相互作用。視覚確認では初期の不安定挙動は解消されており、安定的な探索が可能になった。
 
 今後: `results.npy`から各反復の最良値の平均・信頼区間を算出する集計スクリプトを追加し、数値的な収束比較（終盤100反復の平均差、AUC、MWU検定など）を提示すると論文品質の報告になります。
+
+## 出力プロット一覧
+実験ノートの実行で生成された主要プロットを一覧化します（同ディレクトリ配下の`output_results_cosine_similarity_comparison/`）。
+
+### Rastrigin
+- 収束比較: ![Rastrigin comparison](./output_results_cosine_similarity_comparison/Rastrigin_comparison.png)
+- 報酬解析: ![Rastrigin reward analysis](./output_results_cosine_similarity_comparison/Rastrigin_reward_analysis.png)
+
+### Styblinski‑Tang
+- 収束比較: ![Styblinski‑Tang comparison](./output_results_cosine_similarity_comparison/Styblinski-Tang_comparison.png)
+- 報酬解析: ![Styblinski‑Tang reward analysis](./output_results_cosine_similarity_comparison/Styblinski-Tang_reward_analysis.png)
+
+### Ackley
+- 収束比較: ![Ackley comparison](./output_results_cosine_similarity_comparison/Ackley_comparison.png)
+- 報酬解析: ![Ackley reward analysis](./output_results_cosine_similarity_comparison/Ackley_reward_analysis.png)
