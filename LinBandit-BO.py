@@ -23,6 +23,7 @@ from botorch import fit_gpytorch_model
 from botorch.models import SingleTaskGP
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.kernels import RBFKernel, ScaleKernel
+from gpytorch.constraints import GreaterThan
 from botorch.acquisition import ExpectedImprovement
 from botorch.optim import optimize_acqf
 
@@ -46,7 +47,11 @@ class LinBanditBO:
     """
     
     def __init__(self, objective_function, bounds, n_initial=5, n_max=100, 
-                 coordinate_ratio=0.8, n_arms=None, L_min: float = 0.1):
+                 coordinate_ratio=0.8, n_arms=None, L_min: float = 0.1,
+                 use_lengthscale_lower_bound: bool = False,
+                 l_min: float = 0.05,
+                 normalize_inputs_for_gp: bool = False,
+                 track_history: bool = False):
         """
         Parameters
         ----------
@@ -64,6 +69,15 @@ class LinBanditBO:
             アーム数。Noneの場合は次元数の半分（最適化された設定）を使用。
         L_min : float
             勾配ノルムの推定値 L_hat に対する下限値。報酬スケーリングの安定化のために使用。
+        use_lengthscale_lower_bound : bool
+            RBFカーネルの長さスケールに下限を課す（入力は正規化空間を前提）。
+        l_min : float
+            正規化空間 [0,1]^d における長さスケールの下限（例: 0.05）。
+        normalize_inputs_for_gp : bool
+            True の場合、GPへ渡す入力Xを [0,1]^d に正規化して学習・予測。
+            use_lengthscale_lower_bound が True の場合は自動的に正規化を有効化。
+        track_history : bool
+            実験用に、選択方向および報酬ベクトルの履歴を保存。
         """
         self.objective_function = objective_function
         self.bounds = bounds.float()
@@ -96,14 +110,31 @@ class LinBanditBO:
         # 推定リプシッツ定数と下限
         self.L_min = float(L_min)
         self.L_hat = max(1.0, self.L_min)
+
+        # カーネル長さスケール下限/正規化/履歴
+        self.use_lengthscale_lower_bound = bool(use_lengthscale_lower_bound)
+        self.l_min = float(l_min)
+        self.normalize_inputs_for_gp = bool(normalize_inputs_for_gp) or self.use_lengthscale_lower_bound
+        self._range = (self.bounds[1] - self.bounds[0]).float()
+        self.track_history = bool(track_history)
+        if self.track_history:
+            self.reward_history = []
+            self.selected_direction_history = []
         
+    def _to_normalized(self, X):
+        return torch.clamp((X - self.bounds[0]) / self._range, 0.0, 1.0)
+
     def update_model(self):
-        """ガウス過程モデルの更新"""
-        kernel = ScaleKernel(
-            RBFKernel(ard_num_dims=self.X.shape[-1], dtype=torch.float32),
-            dtype=torch.float32, noise_constraint=1e-3
-        ).to(self.X)
-        self.model = SingleTaskGP(self.X, self.Y, covar_module=kernel)
+        """ガウス過程モデルの更新（必要に応じて入力正規化・l下限）"""
+        X_gp = self._to_normalized(self.X) if self.normalize_inputs_for_gp else self.X
+        # RBFカーネル（必要に応じて長さスケールに下限を課す）。dtype/deviceは to(X_gp) で揃える。
+        if self.use_lengthscale_lower_bound:
+            base = RBFKernel(ard_num_dims=self.X.shape[-1],
+                             lengthscale_constraint=GreaterThan(self.l_min))
+        else:
+            base = RBFKernel(ard_num_dims=self.X.shape[-1])
+        kernel = ScaleKernel(base).to(X_gp)
+        self.model = SingleTaskGP(X_gp, self.Y, covar_module=kernel)
         mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
         fit_gpytorch_model(mll)
         
@@ -120,7 +151,8 @@ class LinBanditBO:
         self.update_model()
         
         # 最良点の初期化
-        post_mean = self.model.posterior(self.X).mean.squeeze(-1)
+        X_query = self._to_normalized(self.X) if self.normalize_inputs_for_gp else self.X
+        post_mean = self.model.posterior(X_query).mean.squeeze(-1)
         bi = post_mean.argmin()
         self.best_value = post_mean[bi].item()
         self.best_point = self.X[bi]
@@ -226,7 +258,11 @@ class LinBanditBO:
             t_values = t_scalar_tensor.squeeze(-1)
             points_on_line = self.best_point.unsqueeze(0) + t_values.reshape(-1, 1) * direction.unsqueeze(0)
             points_on_line_clamped = torch.clamp(points_on_line, self.bounds[0].unsqueeze(0), self.bounds[1].unsqueeze(0))
-            return ei(points_on_line_clamped.unsqueeze(1))
+            if self.normalize_inputs_for_gp:
+                pts = self._to_normalized(points_on_line_clamped)
+            else:
+                pts = points_on_line_clamped
+            return ei(pts.unsqueeze(1))
         
         # 獲得関数の最適化
         cand_t, _ = optimize_acqf(
@@ -267,20 +303,26 @@ class LinBanditBO:
             
             # 予測と実際の評価
             with torch.no_grad():
-                predicted_mean = self.model.posterior(new_x.unsqueeze(0)).mean.squeeze().item()
+                x_q = self._to_normalized(new_x.unsqueeze(0)) if self.normalize_inputs_for_gp else new_x.unsqueeze(0)
+                predicted_mean = self.model.posterior(x_q).mean.squeeze().item()
             actual_y = self.objective_function(new_x.unsqueeze(0)).squeeze().item()
             
             # 報酬の計算（勾配ベース - 実験結果に基づく最適設計）
-            new_x_for_grad = new_x.clone().unsqueeze(0)
-            new_x_for_grad.requires_grad_(True)
-            
-            # GPモデルで事後分布を取得
-            posterior = self.model.posterior(new_x_for_grad)
-            mean_at_new_x = posterior.mean
-            
-            # 勾配を計算
-            mean_at_new_x.sum().backward()
-            grad_vector = new_x_for_grad.grad.squeeze(0)
+            if self.normalize_inputs_for_gp:
+                new_x_for_grad = self._to_normalized(new_x.clone()).unsqueeze(0)
+                new_x_for_grad.requires_grad_(True)
+                posterior = self.model.posterior(new_x_for_grad)
+                mean_at_new_x = posterior.mean
+                mean_at_new_x.sum().backward()
+                grad_vector_normed = new_x_for_grad.grad.squeeze(0)
+                grad_vector = grad_vector_normed / (self._range + 1e-12)
+            else:
+                new_x_for_grad = new_x.clone().unsqueeze(0)
+                new_x_for_grad.requires_grad_(True)
+                posterior = self.model.posterior(new_x_for_grad)
+                mean_at_new_x = posterior.mean
+                mean_at_new_x.sum().backward()
+                grad_vector = new_x_for_grad.grad.squeeze(0)
             
             # 報酬ベクトルを定義（絶対値を取ることで影響の大きさを評価）
             reward_vector = grad_vector.abs()
@@ -299,6 +341,9 @@ class LinBanditBO:
             x_arm = direction.view(-1, 1)
             self.A += x_arm @ x_arm.t()
             self.b += scaled_reward_vector  # 勾配ベース報酬（リプシッツスケーリング）
+            if self.track_history:
+                self.selected_direction_history.append(direction.detach().clone())
+                self.reward_history.append(scaled_reward_vector.detach().clone())
             
             # データとモデルの更新
             self.X = torch.cat([self.X, new_x.unsqueeze(0)], 0)
@@ -307,7 +352,8 @@ class LinBanditBO:
             
             # 最良点の更新
             with torch.no_grad():
-                posterior_mean = self.model.posterior(self.X).mean.squeeze(-1)
+                X_query2 = self._to_normalized(self.X) if self.normalize_inputs_for_gp else self.X
+                posterior_mean = self.model.posterior(X_query2).mean.squeeze(-1)
             current_best_idx = posterior_mean.argmin()
             self.best_value = posterior_mean[current_best_idx].item()
             self.best_point = self.X[current_best_idx]
