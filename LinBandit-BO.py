@@ -51,7 +51,8 @@ class LinBanditBO:
                  use_lengthscale_lower_bound: bool = False,
                  l_min: float = 0.05,
                  normalize_inputs_for_gp: bool = False,
-                 track_history: bool = False):
+                 track_history: bool = False,
+                 direction_selection: str = "discrete"):
         """
         Parameters
         ----------
@@ -78,6 +79,11 @@ class LinBanditBO:
             use_lengthscale_lower_bound が True の場合は自動的に正規化を有効化。
         track_history : bool
             実験用に、選択方向および報酬ベクトルの履歴を保存。
+        direction_selection : {"discrete", "continuous_evd", "continuous_fixed"}
+            探索方向の選択方式。
+            - "discrete": 既存の離散アーム（座標+ランダム）から LinUCB で選択（デフォルト）
+            - "continuous_evd": 信頼楕円体の原点から最遠点の方向を厳密計算（固有分解+二分探索）
+            - "continuous_fixed": 上記の高速近似（固定点反復）
         """
         self.objective_function = objective_function
         self.bounds = bounds.float()
@@ -120,6 +126,21 @@ class LinBanditBO:
         if self.track_history:
             self.reward_history = []
             self.selected_direction_history = []
+        
+        # 方向選択方式
+        self.direction_selection = str(direction_selection)
+
+    def _compute_beta_t(self):
+        """LinUCBのβ_t（現行式）を計算。"""
+        sigma = 1.0
+        L = 1.0
+        lambda_reg = 1.0
+        delta = 0.1
+        S = 1.0
+        current_round_t = max(1, self.total_iterations)
+        log_term = max(1e-9, 1 + (current_round_t - 1) * (L**2) / lambda_reg)
+        beta_t = sigma * math.sqrt(self.dim * math.log(log_term / delta)) + math.sqrt(lambda_reg) * S
+        return beta_t
         
     def _to_normalized(self, X):
         return torch.clamp((X - self.bounds[0]) / self._range, 0.0, 1.0)
@@ -223,6 +244,80 @@ class LinBanditBO:
             ucb_scores.append(mean + beta_t * math.sqrt(max(var, 0)))
             
         return int(np.argmax(ucb_scores))
+
+    def _select_direction_continuous_evd(self):
+        """信頼楕円体の原点から最遠点の方向（厳密解: 固有分解+二分探索）。単位ベクトルを返す。"""
+        # A を対称化
+        A = 0.5 * (self.A + self.A.t())
+        # A^{-1} と θ̂
+        A_inv = torch.inverse(A)
+        theta_hat = A_inv @ self.b
+        beta_t = self._compute_beta_t()
+
+        # θ̂ ≈ 0 の場合は最小固有値方向（= A^{-1}の最大固有値方向）
+        if float(theta_hat.norm()) < 1e-12:
+            evals, evecs = torch.linalg.eigh(A)
+            v = evecs[:, 0]
+            return v / (v.norm() + 1e-12)
+
+        # A = U diag(α) U^T, h = U^T θ̂
+        alpha, U = torch.linalg.eigh(A)
+        h = U.t() @ theta_hat
+
+        # g(λ) = Σ α_i h_i^2 / (λ α_i - 1)^2 = β^2 を解く
+        lam_lo = 1.0 / (float(alpha.max())) + 1e-12
+        lam_hi = lam_lo * 1e6
+        target = float(beta_t * beta_t)
+
+        def g(lam_val: float) -> float:
+            denom = lam_val * alpha - 1.0
+            return float(torch.sum(alpha * (h ** 2) / (denom ** 2)))
+
+        if g(lam_lo) < target:
+            v = theta_hat / (theta_hat.norm() + 1e-12)
+            return v
+
+        for _ in range(100):
+            mid = 0.5 * (lam_lo + lam_hi)
+            val = g(mid)
+            if abs(val - target) < 1e-8:
+                lam_lo = lam_hi = mid
+                break
+            if val > target:
+                lam_lo = mid
+            else:
+                lam_hi = mid
+        lam = 0.5 * (lam_lo + lam_hi)
+        denom = lam * alpha - 1.0
+        y = (lam * alpha / denom) * h
+        theta_star = U @ y
+        v = theta_star / (theta_star.norm() + 1e-12)
+        return v
+
+    def _select_direction_continuous_fixed(self):
+        """固定点反復による連続最適方向の近似。単位ベクトルを返す。"""
+        A = 0.5 * (self.A + self.A.t())
+        A_inv = torch.inverse(A)
+        theta_hat = A_inv @ self.b
+        beta_t = self._compute_beta_t()
+
+        # 初期ベクトル
+        if float(theta_hat.norm()) < 1e-12:
+            x = torch.randn_like(theta_hat)
+        else:
+            x = theta_hat.clone()
+        x = x / (x.norm() + 1e-12)
+
+        for _ in range(50):
+            y = A_inv @ x
+            denom = torch.sqrt(torch.clamp(x @ y, min=1e-18))
+            z = theta_hat + beta_t * (y / denom)
+            x_new = z / (z.norm() + 1e-12)
+            if float((x_new - x).norm()) < 1e-8:
+                x = x_new
+                break
+            x = x_new
+        return x
     
     def propose_new_x(self, direction):
         """選択された方向に沿った最適化"""
@@ -291,12 +386,17 @@ class LinBanditBO:
         while n_iter < self.n_max:
             self.total_iterations += 1
             
-            # 探索方向の候補生成
-            arms_features = self.generate_arms()
-            
-            # Linear UCBによる方向選択
-            sel_idx = self.select_arm(arms_features)
-            direction = arms_features[sel_idx]
+            # 探索方向の選択
+            if self.direction_selection == "discrete":
+                arms_features = self.generate_arms()
+                sel_idx = self.select_arm(arms_features)
+                direction = arms_features[sel_idx]
+            elif self.direction_selection == "continuous_evd":
+                direction = self._select_direction_continuous_evd()
+            elif self.direction_selection == "continuous_fixed":
+                direction = self._select_direction_continuous_fixed()
+            else:
+                raise ValueError(f"Unknown direction_selection: {self.direction_selection}")
             
             # 選択された方向に沿った最適化
             new_x = self.propose_new_x(direction)
