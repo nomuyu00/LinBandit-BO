@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LinBandit-BO: Linear Bandit-based Bayesian Optimization
+LinBandit-BO: Linear Bandit-based Bayesian Optimization (NLPD*dir 版)
 
-高次元最適化問題に対して、Linear Bandit (LinUCB) とBayesian Optimization (BO)を
-組み合わせたアルゴリズムです。
+高次元最適化問題に対して、Linear Bandit (LinUCB) と Bayesian Optimization (BO) を
+組み合わせたアルゴリズムです。本実装は hpo_benchmark_reward_function_comparison で
+比較している「NLPD*dir」を基本アルゴリズムとして採用しています。
 
-主な特徴:
-- Linear UCBで探索方向を適応的に選択
-- ベイズ最適化で選択された方向に沿って最適点を探索
-- 高次元でも効率的に動作（100次元以上でも実用的）
-- 最適化された設定：0.5x arms + 勾配ベース報酬
+要点:
+- 方向選択: Continuous-Fixed（固定点反復）で信頼楕円体に基づく方向を選択
+- 取得関数: Expected Improvement (EI)
+- ラインサーチ: 方向に沿った1次元の粗グリッド + 局所33点で安定最適化
+- 報酬: NLPD（負の対数予測密度）を平滑化正規化したスカラー r を用い、b ← b + r·direction
 """
 
 import math
@@ -38,6 +39,25 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+class EMA:
+    """指数移動平均（NLPD 正規化用途）。"""
+    def __init__(self, alpha: float = 0.1, eps: float = 1e-8) -> None:
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self._m = None
+
+    def update(self, x: float) -> float:
+        if self._m is None:
+            self._m = float(x)
+        else:
+            self._m = self.alpha * float(x) + (1.0 - self.alpha) * self._m
+        return float(self._m)
+
+    @property
+    def value(self) -> float:
+        return float(self._m if self._m is not None else self.eps)
+
+
 class LinBanditBO:
     """
     LinBandit-BO: Linear Bandit-based Bayesian Optimization
@@ -52,7 +72,7 @@ class LinBanditBO:
                  l_min: float = 0.05,
                  normalize_inputs_for_gp: bool = False,
                  track_history: bool = False,
-                 direction_selection: str = "discrete"):
+                 direction_selection: str = "continuous_fixed"):
         """
         Parameters
         ----------
@@ -129,6 +149,9 @@ class LinBanditBO:
         
         # 方向選択方式
         self.direction_selection = str(direction_selection)
+
+        # NLPD の指数移動平均（スケール正規化用）
+        self._ema_nlpd = EMA(alpha=0.1)
 
     def _compute_beta_t(self):
         """LinUCBのβ_t（現行式）を計算。"""
@@ -320,64 +343,79 @@ class LinBanditBO:
         return x
     
     def propose_new_x(self, direction):
-        """選択された方向に沿った最適化"""
+        """方向に沿った1D EI最大化（粗グリッド + 局所33点）。"""
+        assert self.model is not None and self.best_point is not None
         ei = ExpectedImprovement(self.model, best_f=self.best_value, maximize=False)
-        
-        # 方向に沿った探索範囲の計算
-        active_dims_mask = direction.abs() > 1e-9
-        if not active_dims_mask.any():
+
+        # 可動範囲 [lb, ub] を direction に沿って算出
+        active = direction.abs() > 1e-9
+        if not active.any():
             lb, ub = -1.0, 1.0
         else:
-            ratios_lower = (self.bounds[0] - self.best_point) / (direction + 1e-12 * (~active_dims_mask))
-            ratios_upper = (self.bounds[1] - self.best_point) / (direction + 1e-12 * (~active_dims_mask))
-            
-            t_bounds = torch.zeros(self.dim, 2, device=self.X.device)
-            t_bounds[:, 0] = torch.minimum(ratios_lower, ratios_upper)
-            t_bounds[:, 1] = torch.maximum(ratios_lower, ratios_upper)
-            
-            lb = -float('inf')
-            ub = float('inf')
-            for i in range(self.dim):
-                if active_dims_mask[i]:
-                    lb = max(lb, t_bounds[i, 0].item())
-                    ub = min(ub, t_bounds[i, 1].item())
-                    
-        if lb > ub:
-            domain_width = (self.bounds[1, 0] - self.bounds[0, 0]).item()
-            lb = -0.1 * domain_width
-            ub = 0.1 * domain_width
-            
-        one_d_bounds = torch.tensor([[lb], [ub]], dtype=torch.float32, device=self.X.device)
-        
-        def ei_on_line(t_scalar_tensor):
-            t_values = t_scalar_tensor.squeeze(-1)
-            points_on_line = self.best_point.unsqueeze(0) + t_values.reshape(-1, 1) * direction.unsqueeze(0)
-            points_on_line_clamped = torch.clamp(points_on_line, self.bounds[0].unsqueeze(0), self.bounds[1].unsqueeze(0))
-            if self.normalize_inputs_for_gp:
-                pts = self._to_normalized(points_on_line_clamped)
-            else:
-                pts = points_on_line_clamped
-            return ei(pts.unsqueeze(1))
-        
-        # 獲得関数の最適化
-        cand_t, _ = optimize_acqf(
-            ei_on_line,
-            bounds=one_d_bounds,
-            q=1,
-            num_restarts=10,
-            raw_samples=100
-        )
-        
-        alpha_star = cand_t.item()
-        new_x = self.best_point + alpha_star * direction
-        new_x_clamped = torch.clamp(new_x, self.bounds[0], self.bounds[1])
-        
-        return new_x_clamped
+            ratios_lower = (self.bounds[0] - self.best_point) / (direction + 1e-12 * (~active))
+            ratios_upper = (self.bounds[1] - self.best_point) / (direction + 1e-12 * (~active))
+            t_bounds = torch.stack([
+                torch.minimum(ratios_lower, ratios_upper),
+                torch.maximum(ratios_lower, ratios_upper)
+            ], dim=-1)
+            lb = -float("inf"); ub = float("inf")
+            for idx in range(self.dim):
+                if active[idx]:
+                    lb = max(lb, float(t_bounds[idx, 0]))
+                    ub = min(ub, float(t_bounds[idx, 1]))
+        if not (math.isfinite(lb) and math.isfinite(ub)) or lb >= ub:
+            width = float(self.bounds[1, 0] - self.bounds[0, 0])
+            lb, ub = -0.1 * width, 0.1 * width
+
+        device = self.bounds.device; dtype = self.bounds.dtype
+        n_grid = max(128, min(512, 64 + 4 * self.dim))
+        t_grid = torch.linspace(lb, ub, steps=n_grid, device=device, dtype=dtype)
+        pts = self.best_point.unsqueeze(0) + t_grid.reshape(-1, 1) * direction.unsqueeze(0)
+        pts = torch.clamp(pts, self.bounds[0].unsqueeze(0), self.bounds[1].unsqueeze(0))
+        pts_n = self._to_normalized(pts) if self.normalize_inputs_for_gp else pts
+        with torch.no_grad():
+            vals = ei(pts_n.unsqueeze(1)).view(-1)
+        mask = torch.isfinite(vals)
+        if not mask.any():
+            alpha_star = 0.0
+        else:
+            vals[~mask] = -float("inf")
+            best_idx = int(torch.argmax(vals).item())
+            alpha_star = float(t_grid[best_idx].item())
+            step = float((ub - lb) / (n_grid - 1)) if n_grid > 1 else 0.0
+            if step > 0:
+                local_lb = max(lb, alpha_star - 5 * step)
+                local_ub = min(ub, alpha_star + 5 * step)
+                t_local = torch.linspace(local_lb, local_ub, steps=33, device=device, dtype=dtype)
+                pts_l = self.best_point.unsqueeze(0) + t_local.reshape(-1, 1) * direction.unsqueeze(0)
+                pts_l = torch.clamp(pts_l, self.bounds[0].unsqueeze(0), self.bounds[1].unsqueeze(0))
+                pts_l_n = self._to_normalized(pts_l) if self.normalize_inputs_for_gp else pts_l
+                with torch.no_grad():
+                    vals_l = ei(pts_l_n.unsqueeze(1)).view(-1)
+                mask_l = torch.isfinite(vals_l)
+                if mask_l.any():
+                    vals_l[~mask_l] = -float("inf")
+                    j = int(torch.argmax(vals_l).item())
+                    alpha_star = float(t_local[j].item())
+        x_new = self.best_point + alpha_star * direction
+        return torch.clamp(x_new, self.bounds[0], self.bounds[1])
+
+    def _compute_nlpd_reward(self, y_actual: float, mu_pred: float, var_pred: float, noise_var: float) -> float:
+        """NLPD を EMA でスケール正規化し [0,1] にクリップして返す。"""
+        eps = 1e-9
+        sigma2 = max(float(var_pred + noise_var), eps)
+        resid2 = float((y_actual - mu_pred) ** 2)
+        nlpd = 0.5 * math.log(2.0 * math.pi * sigma2) + 0.5 * (resid2 / sigma2)
+        ema = self._ema_nlpd.value
+        r_scaled = nlpd / max(ema, eps)
+        self._ema_nlpd.update(nlpd)
+        # 数値安定化のためクリップ
+        return max(0.0, min(1.0, float(r_scaled)))
     
     def optimize(self):
         """メインの最適化ループ"""
         print(f"LinBandit-BO開始: {self.dim}次元, アーム数: {self.n_arms}本, 最大{self.n_max}回評価")
-        print(f"最適化設定: 勾配ベース報酬 + 0.5x arms (実験結果に基づく)")
+        print(f"最適化設定: NLPD*dir + 0.5x arms + 1D-EI(粗+局所33)")
         
         # 初期化
         self.initialize()
@@ -401,49 +439,31 @@ class LinBanditBO:
             # 選択された方向に沿った最適化
             new_x = self.propose_new_x(direction)
             
-            # 予測と実際の評価
+            # 予測（平均・分散）と実際の評価
             with torch.no_grad():
                 x_q = self._to_normalized(new_x.unsqueeze(0)) if self.normalize_inputs_for_gp else new_x.unsqueeze(0)
-                predicted_mean = self.model.posterior(x_q).mean.squeeze().item()
-            actual_y = self.objective_function(new_x.unsqueeze(0)).squeeze().item()
-            
-            # 報酬の計算（勾配ベース - 実験結果に基づく最適設計）
-            if self.normalize_inputs_for_gp:
-                new_x_for_grad = self._to_normalized(new_x.clone()).unsqueeze(0)
-                new_x_for_grad.requires_grad_(True)
-                posterior = self.model.posterior(new_x_for_grad)
-                mean_at_new_x = posterior.mean
-                mean_at_new_x.sum().backward()
-                grad_vector_normed = new_x_for_grad.grad.squeeze(0)
-                grad_vector = grad_vector_normed / (self._range + 1e-12)
-            else:
-                new_x_for_grad = new_x.clone().unsqueeze(0)
-                new_x_for_grad.requires_grad_(True)
-                posterior = self.model.posterior(new_x_for_grad)
-                mean_at_new_x = posterior.mean
-                mean_at_new_x.sum().backward()
-                grad_vector = new_x_for_grad.grad.squeeze(0)
-            
-            # 報酬ベクトルを定義（絶対値を取ることで影響の大きさを評価）
-            reward_vector = grad_vector.abs()
-            
-            # 推定リプシッツ定数の更新（下限付き）
-            grad_norm = reward_vector.norm().item()
-            if grad_norm > self.L_hat:
-                self.L_hat = grad_norm
-            # 下限を適用
-            L_effective = max(self.L_hat, self.L_min)
+                post = self.model.posterior(x_q)
+                mu_pred = float(post.mean.squeeze().item())
+                var_pred = float(post.variance.squeeze().item())
+            actual_y = float(self.objective_function(new_x.unsqueeze(0)).squeeze().item())
 
-            # リプシッツ定数でスケーリング（下限によりスパイク抑制）
-            scaled_reward_vector = reward_vector / L_effective
-            
-            # Linear Banditパラメータの更新
+            # 観測ノイズ分散の推定
+            try:
+                noise_var = float(self.model.likelihood.noise.mean().item())
+            except Exception:
+                noise_var = 1e-6
+
+            # NLPD スカラー報酬 r（[0,1]にクリップ）
+            r_scalar = self._compute_nlpd_reward(actual_y, mu_pred, var_pred, noise_var)
+            reward_vector = r_scalar * (direction / (direction.norm() + 1e-12))
+
+            # Linear Bandit パラメータの更新
             x_arm = direction.view(-1, 1)
             self.A += x_arm @ x_arm.t()
-            self.b += scaled_reward_vector  # 勾配ベース報酬（リプシッツスケーリング）
+            self.b += reward_vector
             if self.track_history:
                 self.selected_direction_history.append(direction.detach().clone())
-                self.reward_history.append(scaled_reward_vector.detach().clone())
+                self.reward_history.append(torch.as_tensor(reward_vector).detach().clone())
             
             # データとモデルの更新
             self.X = torch.cat([self.X, new_x.unsqueeze(0)], 0)
@@ -463,12 +483,12 @@ class LinBanditBO:
             
             # 進捗表示
             if n_iter % 10 == 0:
-                print(f"  評価回数: {n_iter}/{self.n_max}, 現在の最良値: {self.best_value:.6f}, L_hat: {self.L_hat:.4f}")
+                print(f"  評価回数: {n_iter}/{self.n_max}, 現在の最良値: {self.best_value:.6f}")
                 
         print(f"\n最適化完了!")
         print(f"最良値: {self.best_value:.6f}")
         print(f"最良点: {self.best_point[:5]}... (最初の5次元)")
-        print(f"最終L_hat: {self.L_hat:.6f}")
+        
         
         return self.best_point, self.best_value
 
