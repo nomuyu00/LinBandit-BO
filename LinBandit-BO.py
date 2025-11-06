@@ -18,6 +18,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+from typing import Optional
 
 # BoTorch / GPyTorch
 from botorch import fit_gpytorch_model
@@ -26,10 +27,9 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.constraints import GreaterThan
 from botorch.acquisition import ExpectedImprovement
-from botorch.optim import optimize_acqf
 
-# デフォルトのdtypeをfloat32に設定
-torch.set_default_dtype(torch.float32)
+
+# 実験側で適切な dtype を設定するため、ここでは強制しない（実験スクリプトで上書き）
 
 # プロット設定
 plt.rcParams["figure.dpi"] = 100
@@ -60,19 +60,21 @@ class EMA:
 
 class LinBanditBO:
     """
-    LinBandit-BO: Linear Bandit-based Bayesian Optimization
-    
-    高次元最適化のためのアルゴリズムで、Linear UCBとBayesian Optimizationを統合。
-    各イテレーションで、LinUCBが探索方向を選択し、その方向に沿ってBOが最適化を行います。
+    LinBandit-BO: Linear Bandit-based Bayesian Optimization（NLPD*dir）
+
+    各イテレーションで、固定点反復（Continuous-Fixed）により探索方向を決定し、
+    その方向に沿って EI を 1 次元探索（粗グリッド＋局所 33 点）で最大化して次点を提案。
+    予測の負の対数予測密度（NLPD）をスカラー報酬（EMA 正規化）として用い、
+    b ← b + r·direction で LinUCB の十分統計を更新します。
     """
     
-    def __init__(self, objective_function, bounds, n_initial=5, n_max=100, 
-                 coordinate_ratio=0.8, n_arms=None, L_min: float = 0.1,
+    def __init__(self, objective_function, bounds, n_initial=5, n_max=100,
                  use_lengthscale_lower_bound: bool = False,
                  l_min: float = 0.05,
                  normalize_inputs_for_gp: bool = False,
                  track_history: bool = False,
-                 direction_selection: str = "continuous_fixed"):
+                 device: Optional[torch.device] = None,
+                 initial_X: Optional[torch.Tensor] = None):
         """
         Parameters
         ----------
@@ -84,12 +86,6 @@ class LinBanditBO:
             初期サンプル数（ランダムサンプリング）
         n_max : int
             最大評価回数
-        coordinate_ratio : float
-            座標方向の割合（0.0-1.0）。1.0なら全て座標方向、0.0なら全てランダム方向。
-        n_arms : int or None
-            アーム数。Noneの場合は次元数の半分（最適化された設定）を使用。
-        L_min : float
-            勾配ノルムの推定値 L_hat に対する下限値。報酬スケーリングの安定化のために使用。
         use_lengthscale_lower_bound : bool
             RBFカーネルの長さスケールに下限を課す（入力は正規化空間を前提）。
         l_min : float
@@ -99,29 +95,28 @@ class LinBanditBO:
             use_lengthscale_lower_bound が True の場合は自動的に正規化を有効化。
         track_history : bool
             実験用に、選択方向および報酬ベクトルの履歴を保存。
-        direction_selection : {"discrete", "continuous_evd", "continuous_fixed"}
-            探索方向の選択方式。
-            - "discrete": 既存の離散アーム（座標+ランダム）から LinUCB で選択（デフォルト）
-            - "continuous_evd": 信頼楕円体の原点から最遠点の方向を厳密計算（固有分解+二分探索）
-            - "continuous_fixed": 上記の高速近似（固定点反復）
         """
         self.objective_function = objective_function
-        self.bounds = bounds.float()
+        # device 選択
+        self.device = bounds.device if device is None else device
+        # bounds の dtype を尊重（実験側で統一）
+        self.bounds = bounds.to(device=self.device)
         self.dim = bounds.shape[1]
         self.n_initial = n_initial
         self.n_max = n_max
-        self.coordinate_ratio = coordinate_ratio
-        
-        # 最適なアーム数設定（実験結果に基づく）
-        self.n_arms = n_arms if n_arms is not None else max(1, self.dim // 2)
         
         # Linear Banditのパラメータ
-        self.A = torch.eye(self.dim)
-        self.b = torch.zeros(self.dim)
+        self.A = torch.eye(self.dim, dtype=self.bounds.dtype, device=self.device)
+        self.b = torch.zeros(self.dim, dtype=self.bounds.dtype, device=self.device)
         
-        # 初期点の生成
-        self.X = torch.rand(n_initial, self.dim) * (bounds[1] - bounds[0]) + bounds[0]
-        self.X = self.X.float()
+        # 初期点の生成（外部から与えられた場合はそれを使用）
+        if initial_X is not None:
+            X0 = initial_X.to(dtype=self.bounds.dtype, device=self.device)
+            assert X0.shape == (n_initial, self.dim), "initial_X shape must be (n_initial, dim)"
+            # 念のため境界にクランプ
+            self.X = torch.clamp(X0, self.bounds[0], self.bounds[1])
+        else:
+            self.X = torch.rand(n_initial, self.dim, dtype=self.bounds.dtype, device=self.device) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         
         # 状態変数
         self.Y = None
@@ -130,25 +125,17 @@ class LinBanditBO:
         self.model = None
         self.eval_history = []
         self.theta_history = []
-        self.scale_init = 1.0
         self.total_iterations = 0
-        
-        # 推定リプシッツ定数と下限
-        self.L_min = float(L_min)
-        self.L_hat = max(1.0, self.L_min)
 
         # カーネル長さスケール下限/正規化/履歴
         self.use_lengthscale_lower_bound = bool(use_lengthscale_lower_bound)
         self.l_min = float(l_min)
         self.normalize_inputs_for_gp = bool(normalize_inputs_for_gp) or self.use_lengthscale_lower_bound
-        self._range = (self.bounds[1] - self.bounds[0]).float()
+        self._range = (self.bounds[1] - self.bounds[0]).to(dtype=self.bounds.dtype, device=self.device)
         self.track_history = bool(track_history)
         if self.track_history:
             self.reward_history = []
             self.selected_direction_history = []
-        
-        # 方向選択方式
-        self.direction_selection = str(direction_selection)
 
         # NLPD の指数移動平均（スケール正規化用）
         self._ema_nlpd = EMA(alpha=0.1)
@@ -185,11 +172,7 @@ class LinBanditBO:
     def initialize(self):
         """初期化：初期点での評価とモデル構築"""
         y_val = self.objective_function(self.X)
-        self.Y = y_val.unsqueeze(-1).float()
-        
-        # スケーリング係数の計算
-        y_max, y_min = self.Y.max().item(), self.Y.min().item()
-        self.scale_init = (y_max - y_min) if (y_max - y_min) != 0 else 1.0
+        self.Y = y_val.unsqueeze(-1).to(dtype=self.bounds.dtype, device=self.device)
         
         # モデルの初期化
         self.update_model()
@@ -202,120 +185,8 @@ class LinBanditBO:
         self.best_point = self.X[bi]
         self.eval_history = [self.best_value] * self.n_initial
         
-    def generate_arms(self):
-        """
-        LinBandit-BOの特徴的な部分：ランダムに方向を選択
-        座標方向とランダム方向を組み合わせた候補集合を生成
-        実験結果に基づき、最適なアーム数（0.5x arms）を使用
-        """
-        num_coord = int(self.coordinate_ratio * self.n_arms)
-        num_coord = min(num_coord, self.dim)
-        
-        # ランダムに座標を選択（LinBandit-BOの特徴）
-        idxs = np.random.choice(self.dim, num_coord, replace=False)
-        
-        # 座標方向の生成
-        coords = []
-        for i in idxs:
-            e = torch.zeros(self.dim, device=self.X.device)
-            e[i] = 1.0
-            coords.append(e)
-            
-        coord_arms = torch.stack(coords, 0) if coords else torch.zeros(0, self.dim, device=self.X.device)
-        
-        # ランダム方向の生成
-        num_rand = self.n_arms - num_coord
-        rand_arms = torch.randn(num_rand, self.dim, device=self.X.device) if num_rand > 0 else torch.zeros(0, self.dim, device=self.X.device)
-        
-        if num_rand > 0:
-            norms = rand_arms.norm(dim=1, keepdim=True)
-            rand_arms = torch.where(norms > 1e-9, rand_arms / norms, 
-                                   torch.randn_like(rand_arms) / (torch.randn_like(rand_arms).norm(dim=1,keepdim=True)+1e-9))
-            
-        return torch.cat([coord_arms, rand_arms], 0)
-    
-    def select_arm(self, arms_features):
-        """Linear UCBによる方向選択"""
-        # LinUCBパラメータ
-        sigma = 1.0
-        L = 1.0
-        lambda_reg = 1.0
-        delta = 0.1
-        S = 1.0
-        
-        # 現在のパラメータ推定
-        A_inv = torch.inverse(self.A)
-        theta = A_inv @ self.b
-        self.theta_history.append(theta.clone())
-        
-        # 信頼幅の計算
-        current_round_t = max(1, self.total_iterations)
-        log_term_numerator = max(1e-9, 1 + (current_round_t - 1) * L**2 / lambda_reg)
-        beta_t = (sigma * math.sqrt(self.dim * math.log(log_term_numerator / delta)) + 
-                  math.sqrt(lambda_reg) * S)
-        
-        # UCBスコアの計算
-        ucb_scores = []
-        for i in range(arms_features.shape[0]):
-            x = arms_features[i].view(-1, 1)
-            mean = (theta.view(1, -1) @ x).item()
-            try:
-                var = (x.t() @ A_inv @ x).item()
-            except torch.linalg.LinAlgError:
-                var = (x.t() @ torch.linalg.pinv(self.A) @ x).item()
-                
-            ucb_scores.append(mean + beta_t * math.sqrt(max(var, 0)))
-            
-        return int(np.argmax(ucb_scores))
-
-    def _select_direction_continuous_evd(self):
-        """信頼楕円体の原点から最遠点の方向（厳密解: 固有分解+二分探索）。単位ベクトルを返す。"""
-        # A を対称化
-        A = 0.5 * (self.A + self.A.t())
-        # A^{-1} と θ̂
-        A_inv = torch.inverse(A)
-        theta_hat = A_inv @ self.b
-        beta_t = self._compute_beta_t()
-
-        # θ̂ ≈ 0 の場合は最小固有値方向（= A^{-1}の最大固有値方向）
-        if float(theta_hat.norm()) < 1e-12:
-            evals, evecs = torch.linalg.eigh(A)
-            v = evecs[:, 0]
-            return v / (v.norm() + 1e-12)
-
-        # A = U diag(α) U^T, h = U^T θ̂
-        alpha, U = torch.linalg.eigh(A)
-        h = U.t() @ theta_hat
-
-        # g(λ) = Σ α_i h_i^2 / (λ α_i - 1)^2 = β^2 を解く
-        lam_lo = 1.0 / (float(alpha.max())) + 1e-12
-        lam_hi = lam_lo * 1e6
-        target = float(beta_t * beta_t)
-
-        def g(lam_val: float) -> float:
-            denom = lam_val * alpha - 1.0
-            return float(torch.sum(alpha * (h ** 2) / (denom ** 2)))
-
-        if g(lam_lo) < target:
-            v = theta_hat / (theta_hat.norm() + 1e-12)
-            return v
-
-        for _ in range(100):
-            mid = 0.5 * (lam_lo + lam_hi)
-            val = g(mid)
-            if abs(val - target) < 1e-8:
-                lam_lo = lam_hi = mid
-                break
-            if val > target:
-                lam_lo = mid
-            else:
-                lam_hi = mid
-        lam = 0.5 * (lam_lo + lam_hi)
-        denom = lam * alpha - 1.0
-        y = (lam * alpha / denom) * h
-        theta_star = U @ y
-        v = theta_star / (theta_star.norm() + 1e-12)
-        return v
+    # generate_arms / select_arm / select_direction_continuous_evd は
+    # 固定点反復で方向を選ぶ設計では不要のため削除。
 
     def _select_direction_continuous_fixed(self):
         """固定点反復による連続最適方向の近似。単位ベクトルを返す。"""
@@ -413,9 +284,9 @@ class LinBanditBO:
         return max(0.0, min(1.0, float(r_scaled)))
     
     def optimize(self):
-        """メインの最適化ループ"""
-        print(f"LinBandit-BO開始: {self.dim}次元, アーム数: {self.n_arms}本, 最大{self.n_max}回評価")
-        print(f"最適化設定: NLPD*dir + 0.5x arms + 1D-EI(粗+局所33)")
+        """メインの最適化ループ（方向は固定点反復、報酬はNLPD*dir）。"""
+        print(f"LinBandit-BO開始: {self.dim}次元, 最大{self.n_max}回評価")
+        print(f"最適化設定: 方向=Continuous-Fixed, 報酬=NLPD*dir, 1D-EI(粗+局所33)")
         
         # 初期化
         self.initialize()
@@ -424,17 +295,9 @@ class LinBanditBO:
         while n_iter < self.n_max:
             self.total_iterations += 1
             
-            # 探索方向の選択
-            if self.direction_selection == "discrete":
-                arms_features = self.generate_arms()
-                sel_idx = self.select_arm(arms_features)
-                direction = arms_features[sel_idx]
-            elif self.direction_selection == "continuous_evd":
-                direction = self._select_direction_continuous_evd()
-            elif self.direction_selection == "continuous_fixed":
-                direction = self._select_direction_continuous_fixed()
-            else:
-                raise ValueError(f"Unknown direction_selection: {self.direction_selection}")
+            # 探索方向の選択（固定点反復）
+            direction = self._select_direction_continuous_fixed()
+            direction = direction / (direction.norm() + 1e-12)
             
             # 選択された方向に沿った最適化
             new_x = self.propose_new_x(direction)
@@ -461,6 +324,11 @@ class LinBanditBO:
             x_arm = direction.view(-1, 1)
             self.A += x_arm @ x_arm.t()
             self.b += reward_vector
+            # θ の履歴も更新
+            try:
+                self.theta_history.append(torch.inverse(self.A) @ self.b)
+            except Exception:
+                pass
             if self.track_history:
                 self.selected_direction_history.append(direction.detach().clone())
                 self.reward_history.append(torch.as_tensor(reward_vector).detach().clone())
@@ -527,7 +395,6 @@ def run_demo():
         bounds=bounds,
         n_initial=5,
         n_max=100,
-        coordinate_ratio=0.8  # 80%を座標方向、20%をランダム方向
     )
     
     best_x, best_y = optimizer.optimize()

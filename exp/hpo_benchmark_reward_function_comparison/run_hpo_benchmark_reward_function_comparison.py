@@ -22,7 +22,7 @@ import math
 import os
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -113,9 +113,11 @@ class RewardFunctionFixedDirectionBO:
         L_min: float = 0.1,
         l_min_floor: float = 0.10,
         initial_X: torch.Tensor | None = None,
+        device: Optional[torch.device] = None,
     ) -> None:
         self.objective_function = objective_function
-        self.bounds = bounds.to(dtype=torch.get_default_dtype())
+        self.device = bounds.device if device is None else device
+        self.bounds = bounds.to(dtype=torch.get_default_dtype(), device=self.device)
         self.dim = bounds.shape[1]
         self.n_initial = int(n_initial)
         self.n_max = int(n_max)
@@ -124,14 +126,14 @@ class RewardFunctionFixedDirectionBO:
         self.l_min = float(l_min_floor)
 
         # 線形バンディット
-        self.A = torch.eye(self.dim, dtype=torch.get_default_dtype())
-        self.b = torch.zeros(self.dim, dtype=torch.get_default_dtype())
+        self.A = torch.eye(self.dim, dtype=torch.get_default_dtype(), device=self.device)
+        self.b = torch.zeros(self.dim, dtype=torch.get_default_dtype(), device=self.device)
 
         # 初期点
         if initial_X is None:
-            self.X = torch.rand(self.n_initial, self.dim, dtype=torch.get_default_dtype()) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+            self.X = torch.rand(self.n_initial, self.dim, dtype=torch.get_default_dtype(), device=self.device) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         else:
-            self.X = initial_X.clone().to(dtype=torch.get_default_dtype())
+            self.X = initial_X.clone().to(dtype=torch.get_default_dtype(), device=self.device)
 
         # 状態
         self.Y: torch.Tensor | None = None
@@ -150,7 +152,7 @@ class RewardFunctionFixedDirectionBO:
         self.L_hat_history: List[float] = []
 
         # 勾配スケール/正規化
-        self._range = (self.bounds[1] - self.bounds[0]).to(dtype=torch.get_default_dtype())
+        self._range = (self.bounds[1] - self.bounds[0]).to(dtype=torch.get_default_dtype(), device=self.device)
         self.L_hat = max(1.0, self.L_min)
         self.ema_nlpd = EMA(alpha=0.1)
 
@@ -178,7 +180,7 @@ class RewardFunctionFixedDirectionBO:
     def initialize(self) -> None:
         with torch.no_grad():
             y_val = self.objective_function(self.X)
-        self.Y = y_val.unsqueeze(-1).to(dtype=torch.get_default_dtype())
+        self.Y = y_val.unsqueeze(-1).to(dtype=torch.get_default_dtype(), device=self.device)
         self.update_model()
         Xn = self._to_normalized(self.X)
         with torch.no_grad():
