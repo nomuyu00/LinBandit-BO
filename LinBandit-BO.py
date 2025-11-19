@@ -32,8 +32,9 @@ from botorch.acquisition import ExpectedImprovement
 # 実験側で適切な dtype を設定するため、ここでは強制しない（実験スクリプトで上書き）
 
 # プロット設定
+# NOTE: フォントは実験スクリプト側（例: japanize_matplotlib など）で適切に設定する。
+# ここで固定すると日本語フォント指定を上書きしてしまい、文字化けの原因になるため設定しない。
 plt.rcParams["figure.dpi"] = 100
-plt.rcParams['font.family'] = 'DejaVu Sans'
 
 import warnings
 warnings.filterwarnings("ignore")

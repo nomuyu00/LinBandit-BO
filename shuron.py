@@ -8,6 +8,7 @@ from botorch.acquisition import ExpectedImprovement  # 取得関数 EI
 from gpytorch.mlls import ExactMarginalLogLikelihood  # 厳密周辺尤度（GP 学習用）
 from gpytorch.kernels import RBFKernel, ScaleKernel  # RBF(ARD) + スケールカーネル
 from gpytorch.constraints import GreaterThan  # （必要なら）ハイパーパラメータ下限
+from botorch.models.transforms.outcome import Standardize  # 出力標準化
 import warnings  # 警告抑制
 warnings.filterwarnings("ignore")  # 学習時の警告を見やすさのため抑制
 
@@ -34,7 +35,7 @@ class EMA:  # EMA = Exponential Moving Average の簡単な実装
 
 # ===== 本体：超シンプル LinBandit-BO（Continuous-Fixed + EI + NLPD*dir） =====
 class SimpleLinBanditBONLPDDir:  # 読みやすさ重視の最小クラス
-    def __init__(self, objective_function, bounds, n_initial=5, n_max=100, l_min=0.0):  # 主要パラメータ
+    def __init__(self, objective_function, bounds, n_initial=5, n_max=100, l_min=0.0, initial_X=None):  # 主要パラメータ
         self.objective_function = objective_function  # 最小化したい目的関数 f(x)
         self.bounds = bounds.detach().clone().double()  # 探索範囲 [2, d]（下限・上限）
         self.dim = self.bounds.shape[1]  # 次元 d
@@ -50,7 +51,29 @@ class SimpleLinBanditBONLPDDir:  # 読みやすさ重視の最小クラス
         self.best_x = None  # これまでの最良点（観測上あるいは事後平均上の指標）
         self.best_y = None  # その値
         self.total_iterations = 0  # 反復カウンタ
-        self.l_min = float(l_min)  # RBF の lengthscale 下限（0で無効）
+        self.l_min = float(l_min)  # RBF の lengthscale 下限（正規化空間での下限値）
+        self.initial_X = initial_X  # 事前に与えられた初期点（任意）
+
+        # 入力正規化（[0,1]^d）をGP学習/予測に適用
+        self._range = (self.bounds[1] - self.bounds[0]).clamp_min(1e-12)
+        self._use_input_normalization = True
+        self.X_norm = None  # 正規化済み入力（GP用）
+
+        # 出力標準化の利用（EIのスケール安定化）
+        self._use_output_standardize = True
+
+        # ライン探索に用いる信頼領域(TR)の状態（TuRBO 風の簡易バージョン）
+        self.tr_length = 0.8
+        self.tr_min_length = 0.5 ** 7
+        self.tr_max_length = 1.6
+        self.tr_success = 0
+        self.tr_failure = 0
+
+        # 可視化用の履歴（実験スクリプトで参照）
+        # - continuous_fixed で選択された方向ベクトル（単位化後）
+        # - NLPD*dir のベクトル報酬（r' * a_unit）
+        self.selected_direction_history = []  # List[torch.Tensor] 形状 [d]
+        self.reward_history = []              # List[torch.Tensor] 形状 [d]
 
     # ---- LinUCB の β_t（簡易式）：連続方向の信頼半径に使う ----
     def _beta_t(self) -> float:  # 解析的厳密式ではなく実務的に安定な簡易式
@@ -84,65 +107,106 @@ class SimpleLinBanditBONLPDDir:  # 読みやすさ重視の最小クラス
         return x  # 連続最適方向（近似）
 
     # ---- GP のフィット（SingleTaskGP + RBF(ARD) + MLL 最適化） ----
-    def _fit_gp(self):  # 既存データ X, Y で GP を再学習
-        # RBF の lengthscale に下限を課したい場合のみ制約を付与（0 なら無効）
-        base = RBFKernel(ard_num_dims=self.dim, lengthscale_constraint=GreaterThan(self.l_min) if self.l_min > 0 else None)  # RBF(ARD)
-        kernel = ScaleKernel(base).to(self.X)  # Scale を噛ませる（出力スケール）
-        self.model = SingleTaskGP(self.X, self.Y, covar_module=kernel)  # 単一タスク GP
+    def _to_normalized(self, X: torch.Tensor) -> torch.Tensor:
+        if not self._use_input_normalization:
+            return X
+        return torch.clamp((X - self.bounds[0]) / self._range, 0.0, 1.0)
+
+    def _fit_gp(self):  # 既存データ X, Y で GP を再学習（入力正規化 + l_min + 出力標準化）
+        X_gp = self._to_normalized(self.X)
+        # RBF の lengthscale 下限は正規化空間で適用
+        base = RBFKernel(
+            ard_num_dims=self.dim,
+            lengthscale_constraint=GreaterThan(self.l_min) if self.l_min > 0 else None,
+        )
+        kernel = ScaleKernel(base).to(X_gp)
+        if self._use_output_standardize:
+            self.model = SingleTaskGP(X_gp, self.Y, covar_module=kernel, outcome_transform=Standardize(m=1))
+        else:
+            self.model = SingleTaskGP(X_gp, self.Y, covar_module=kernel)  # 単一タスク GP
         mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)  # MLL
         fit_gpytorch_model(mll)  # MLL 最大化でハイパーパラメータ学習
 
-    # ---- EI の 1 次元ライン最大化（グリッドなし：t に対する勾配上昇） ----
+    # ---- EI の 1 次元ライン最大化（TR内・粗グリッド→局所33点） ----
     def _maximize_ei_along_direction(self, x_best: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:  # 次の x を返す
-        ei = ExpectedImprovement(self.model, best_f=float(self.Y.min().item()), maximize=False)  # 最小化設定の EI
-        dir_unit = direction / (direction.norm() + 1e-12)  # 念のため単位化
-        # 箱型制約のもとで t の許容区間 [t_low, t_high] を求める
-        lb, ub = self.bounds[0], self.bounds[1]  # 下限・上限（d次元）
-        t_low, t_high = -float("inf"), float("inf")  # 初期は広く
-        for i in range(self.dim):  # 次元ごとに交差区間を絞る
-            a = float(dir_unit[i].item())  # 方向の i 成分
-            if abs(a) < 1e-12:  # 成分が 0 に近い場合は無視
-                continue  # 制約無し
-            # (lb[i] - x_best[i]) / a ≤ t ≤ (ub[i] - x_best[i]) / a を反映
-            lo = (float(lb[i].item()) - float(x_best[i].item())) / a  # 下側比
-            hi = (float(ub[i].item()) - float(x_best[i].item())) / a  # 上側比
-            lo, hi = (min(lo, hi), max(lo, hi))  # 順序を正す
-            t_low = max(t_low, lo)  # 全次元の下限の最大
-            t_high = min(t_high, hi)  # 全次元の上限の最小
-        if not (math.isfinite(t_low) and math.isfinite(t_high)) or t_low >= t_high:  # 区間が壊れた時の保険
-            width = float((ub - lb).mean().item())  # 平均幅
-            t_low, t_high = -0.1 * width, 0.1 * width  # 小区間に退避
+        # EIのbest_fは出力標準化を考慮
+        if getattr(self.model, "outcome_transform", None) is not None:
+            try:
+                y_t, _ = self.model.outcome_transform(self.Y)
+                best_f_val = float(y_t.min().item())
+            except Exception:
+                best_f_val = float(self.Y.min().item())
+        else:
+            best_f_val = float(self.Y.min().item())
+        ei = ExpectedImprovement(self.model, best_f=best_f_val, maximize=False)
 
-        # t に対する勾配上昇（複数リスタートで堅牢化）
-        def ei_of_t(t_scalar: torch.Tensor) -> torch.Tensor:  # t→EI(t) を返す関数
-            x = x_best + t_scalar * dir_unit  # ライン上の点 x(t)
-            x = x.clamp(lb, ub)  # 箱内に投影（誤差があっても安全）
-            return ei(x.unsqueeze(0))  # EI は [N, d] 入力なので [1, d] で評価
+        dir_unit = direction / (direction.norm() + 1e-12)
+        lb, ub = self.bounds[0], self.bounds[1]
 
-        best_val, best_t = -float("inf"), None  # ベスト EI 値と t
-        for seed in [0.1, 0.5, 0.9, 0.25, 0.75]:  # 5 リスタート（中点付近＋端寄り）
-            t = torch.tensor([(1 - seed) * t_low + seed * t_high], dtype=self.bounds.dtype, requires_grad=True)  # 初期 t
-            lr = 0.2 * (t_high - t_low)  # 学習率（区間幅に比例）
-            for _ in range(25):  # ステップ回数（軽量）
-                val = ei_of_t(t)  # EI(t) を計算
-                (-val).backward()  # 最大化したいので負号を付けて“最小化”の勾配に
-                with torch.no_grad():  # 勾配更新部分は勾配追跡しない
-                    grad = -t.grad  # d(EI)/dt（正方向に上昇）
-                    t += lr * grad  # 勾配上昇ステップ
-                    t.clamp_(min=t_low, max=t_high)  # t を許容区間に射影
-                    t.grad.zero_()  # 勾配をクリア
-                    lr *= 0.9  # 少しずつ減衰（安定化）
-            with torch.no_grad():  # ベスト更新チェック
-                v = float(ei_of_t(t).item())  # 最終 EI
-                if v > best_val:  # 改善なら採用
-                    best_val, best_t = v, float(t.item())  # ベストを更新
-        x_new = x_best + best_t * dir_unit  # ベスト t の点を採用
-        return x_new.clamp(lb, ub)  # 箱内に収めて返す
+        # 箱由来/ TR由来の t 範囲
+        def interval_from_box(box_lb: torch.Tensor, box_ub: torch.Tensor) -> tuple[float, float]:
+            t_lo, t_hi = -float("inf"), float("inf")
+            for i in range(self.dim):
+                a = float(dir_unit[i].item())
+                if abs(a) < 1e-12:
+                    continue
+                lo = (float(box_lb[i].item()) - float(x_best[i].item())) / a
+                hi = (float(box_ub[i].item()) - float(x_best[i].item())) / a
+                lo, hi = (min(lo, hi), max(lo, hi))
+                t_lo = max(t_lo, lo)
+                t_hi = min(t_hi, hi)
+            return t_lo, t_hi
 
-    # ---- NLPD＊dir のスカラー報酬 r′ を計算し、方向でベクトル化して返す ----
-    def _nlpd_reward_vector(self, x: torch.Tensor, y_actual: float, direction: torch.Tensor) -> torch.Tensor:  # r′·a を返す
+        span = (ub - lb)
+        half = 0.5 * self.tr_length * span
+        tr_lb = torch.max(x_best - half, lb)
+        tr_ub = torch.min(x_best + half, ub)
+
+        g_lo, g_hi = interval_from_box(lb, ub)
+        tr_lo, tr_hi = interval_from_box(tr_lb, tr_ub)
+        t_low = max(g_lo, tr_lo)
+        t_high = min(g_hi, tr_hi)
+        if not (math.isfinite(t_low) and math.isfinite(t_high)) or t_low >= t_high:
+            width = float(span.mean().item())
+            t_low, t_high = -0.1 * width, 0.1 * width
+
+        n_grid = max(128, min(512, 64 + 4 * self.dim))
+        t_grid = torch.linspace(t_low, t_high, steps=n_grid, dtype=self.bounds.dtype)
+        pts = x_best.unsqueeze(0) + t_grid.reshape(-1, 1) * dir_unit.unsqueeze(0)
+        pts = torch.clamp(pts, lb.unsqueeze(0), ub.unsqueeze(0))
+        pts_n = self._to_normalized(pts)
+        with torch.no_grad():
+            vals = ei(pts_n.unsqueeze(1)).view(-1)
+        mask = torch.isfinite(vals)
+        if not mask.any():
+            alpha_star = 0.0
+        else:
+            vals[~mask] = -float("inf")
+            i = int(torch.argmax(vals).item())
+            alpha_star = float(t_grid[i].item())
+            step = float((t_high - t_low) / (n_grid - 1)) if n_grid > 1 else 0.0
+            if step > 0:
+                loc_lb = max(t_low, alpha_star - 5 * step)
+                loc_ub = min(t_high, alpha_star + 5 * step)
+                t_local = torch.linspace(loc_lb, loc_ub, steps=33, dtype=self.bounds.dtype)
+                pts_l = x_best.unsqueeze(0) + t_local.reshape(-1, 1) * dir_unit.unsqueeze(0)
+                pts_l = torch.clamp(pts_l, lb.unsqueeze(0), ub.unsqueeze(0))
+                pts_l_n = self._to_normalized(pts_l)
+                with torch.no_grad():
+                    vals_l = ei(pts_l_n.unsqueeze(1)).view(-1)
+                mask_l = torch.isfinite(vals_l)
+                if mask_l.any():
+                    vals_l[~mask_l] = -float("inf")
+                    j = int(torch.argmax(vals_l).item())
+                    alpha_star = float(t_local[j].item())
+        x_new = x_best + alpha_star * dir_unit
+        return torch.clamp(x_new, lb, ub)
+
+    # ---- NLPD＊dir のスカラー報酬 r を計算し、方向でベクトル化して返す（EMA 正規化なし） ----
+    def _nlpd_reward_vector(self, x: torch.Tensor, y_actual: float, direction: torch.Tensor) -> torch.Tensor:  # r·a を返す
         with torch.no_grad():  # 予測時は勾配不要
-            post = self.model.posterior(x.unsqueeze(0))  # 事後分布 p(f(x)|D)
+            x_n = self._to_normalized(x)
+            post = self.model.posterior(x_n.unsqueeze(0))  # 事後分布 p(f(x)|D)（正規化入力）
             mu = float(post.mean.squeeze().item())  # 予測平均 μ(x)
             var = float(post.variance.squeeze().item())  # 予測分散 s^2(x)
         try:
@@ -151,26 +215,34 @@ class SimpleLinBanditBONLPDDir:  # 読みやすさ重視の最小クラス
             noise_var = 1e-6  # 取得できない場合の小さな既定値
         sigma2 = max(var + noise_var, 1e-12)  # 合成分散 σ_y^2（下限で安定化）
         resid2 = (y_actual - mu) ** 2  # 残差の二乗 (y-μ)^2
-        nlpd = 0.5 * math.log(2.0 * math.pi * sigma2) + 0.5 * (resid2 / sigma2)  # NLPD の定義
-        ema = self._ema_nlpd.value  # 現在の EMA
-        r_prime = max(0.0, min(1.0, nlpd / max(ema, 1e-12)))  # EMA で正規化→[0,1] へクリップ
-        self._ema_nlpd.update(nlpd)  # EMA を更新
+        nlpd = 0.5 * math.log(2.0 * math.pi * sigma2) + 0.5 * (resid2 / sigma2)  # NLPD の定義（生値）
+        r_scalar = float(nlpd)  # 正規化・クリッピングは行わない
         direction_unit = direction / (direction.norm() + 1e-12)  # 方向を単位化（符号は保持）
-        return torch.as_tensor(r_prime, dtype=self.bounds.dtype) * direction_unit  # r′·a（ベクトル）を返す
+        return torch.as_tensor(r_scalar, dtype=self.bounds.dtype) * direction_unit  # r·a（ベクトル）を返す
 
     # ---- 初期化：初期点評価→GP 構築→最良点の初期化 ----
     def initialize(self):  # 実験開始時に 1 度だけ呼ぶ
-        # 一様乱数で初期点を生成（[lb, ub] の箱内）
+        # 事前に与えられた初期点があればそれを用いる。無ければ一様乱数で生成。
         lb, ub = self.bounds[0], self.bounds[1]  # 下限・上限
-        self.X = torch.rand(self.n_initial, self.dim, dtype=self.bounds.dtype) * (ub - lb) + lb  # 初期 X
+        if self.initial_X is not None:
+            X0 = torch.as_tensor(self.initial_X, dtype=self.bounds.dtype)
+            assert X0.shape == (self.n_initial, self.dim)
+            self.X = torch.clamp(X0, lb, ub)
+        else:
+            self.X = torch.rand(self.n_initial, self.dim, dtype=self.bounds.dtype) * (ub - lb) + lb  # 初期 X
         with torch.no_grad():  # 目的関数評価は勾配不要
             y = self.objective_function(self.X)  # ベクトル化評価に対応していると速い
         self.Y = y.reshape(-1, 1).double()  # 列ベクトルに整形
-        self._fit_gp()  # GP 学習
+        # 正規化版も保持
+        self.X_norm = self._to_normalized(self.X)
+        self._fit_gp()  # GP 学習（正規化入力）
         # 観測最小値で最良を初期化（最小化設定）
         idx = int(torch.argmin(self.Y).item())  # 最良インデックス
         self.best_x = self.X[idx].detach().clone()  # 最良点
         self.best_y = float(self.Y[idx].item())  # その値
+        # 履歴を初期化
+        self.selected_direction_history = []
+        self.reward_history = []
 
     # ---- メインループ：Continuous-Fixed で方向→EI でライン最適化→NLPD＊dir で更新 ----
     def optimize(self):  # 最適化本体（最良点と値を返す）
@@ -179,21 +251,52 @@ class SimpleLinBanditBONLPDDir:  # 読みやすさ重視の最小クラス
         while n_eval < self.n_max:  # 目標回数まで繰り返す
             self.total_iterations += 1  # 反復カウンタを進める
             a = self._select_direction_continuous_fixed()  # Continuous‑Fixed で方向を選択
+            # 単位方向（履歴の可視化用に保持）
+            a_unit = a / (a.norm() + 1e-12)
             x_new = self._maximize_ei_along_direction(self.best_x, a)  # 方向に沿って EI を最大化（グリッドなし）
             with torch.no_grad():  # 目的関数評価（最小化）
                 y_new = float(self.objective_function(x_new.unsqueeze(0)).item())  # 新規点の y
             r_vec = self._nlpd_reward_vector(x_new, y_new, a)  # NLPD＊dir のベクトル報酬 r′·a
+            # 履歴の記録（後処理の可視化で使用）
+            try:
+                self.selected_direction_history.append(a_unit.detach().clone())
+                self.reward_history.append(r_vec.detach().clone())
+            except Exception:
+                pass
             x_arm = a.view(-1, 1)  # 方向を列ベクトルに
             self.A += x_arm @ x_arm.t()  # LinUCB の A ← A + a a^T
             self.b += r_vec  # LinUCB の b ← b + r′·a
             # データを追加して GP を再学習
             self.X = torch.cat([self.X, x_new.unsqueeze(0)], dim=0)  # X に追加
             self.Y = torch.cat([self.Y, torch.tensor([[y_new]], dtype=self.bounds.dtype)], dim=0)  # Y に追加
+            self.X_norm = self._to_normalized(self.X)
             self._fit_gp()  # GP をアップデート
-            # 最良の更新（観測最小値ベースで簡素化）
-            if y_new < self.best_y:  # 改善していれば更新
-                self.best_y = y_new  # 最良値更新
-                self.best_x = x_new.detach().clone()  # 最良点更新
+            # 最良の更新（観測最小値ベース）
+            improved = False
+            if y_new < self.best_y:
+                self.best_y = y_new
+                self.best_x = x_new.detach().clone()
+                improved = True
+
+            # TR の更新
+            if improved:
+                self.tr_success += 1
+                self.tr_failure = 0
+            else:
+                self.tr_success = 0
+                self.tr_failure += 1
+            fail_tol = max(4, int(math.ceil(self.dim / 1)))
+            succ_tol = 3
+            if self.tr_success >= succ_tol:
+                self.tr_length = min(self.tr_length * 2.0, self.tr_max_length)
+                self.tr_success = 0
+            elif self.tr_failure >= fail_tol:
+                self.tr_length = self.tr_length / 2.0
+                self.tr_failure = 0
+            if self.tr_length < self.tr_min_length:
+                self.tr_length = 0.8
+                self.tr_success = 0
+                self.tr_failure = 0
             n_eval += 1  # 評価回数をインクリメント
         return self.best_x, self.best_y  # 探索終了：最良点と値を返す
 
