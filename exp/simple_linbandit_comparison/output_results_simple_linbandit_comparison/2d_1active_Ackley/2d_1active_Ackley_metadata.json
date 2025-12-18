@@ -1,0 +1,16 @@
+{
+  "scenario": {
+    "name": "2d_1active_Ackley",
+    "dim": 2,
+    "active": [
+      0
+    ],
+    "budget": 120
+  },
+  "algorithms": [
+    "SimpleLinBandit",
+    "TuRBO-1",
+    "REMBO"
+  ],
+  "runs": 1
+}
